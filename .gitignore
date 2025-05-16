@@ -172,3 +172,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+# RAG build artifacts
+.rag-env/
+.rag_index/
+*.bak
