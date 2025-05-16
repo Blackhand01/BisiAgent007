@@ -10,7 +10,10 @@ import openai
 from dotenv import load_dotenv
 load_dotenv()
 
-# importa rag_tools
+# 1️⃣ vai subito nella root del progetto che vuoi indicizzare
+os.chdir("/Users/stefanoroybisignano/Desktop/Projects/mlops_finetuning_framework")
+
+# 2️⃣ **solo ora** importa rag_tools
 sys.path.append("/Users/stefanoroybisignano/Workspace/BisiAgent007")
 rag_tools = importlib.import_module("rag_tools")
 
@@ -142,5 +145,5 @@ def chat_loop():
 
 # ------------------------------------------------------------------ main
 if __name__ == "__main__":
-    os.chdir("/Users/stefanoroybisignano/Desktop/Projects/mlops_finetuning_framework/src")
     chat_loop()
+    # Refattorizza la funzione main in src/main_workflow.py

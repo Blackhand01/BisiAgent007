@@ -105,17 +105,20 @@ def _resolve(path: str | Path) -> Path:
     p = Path(path)
     return p if p.is_absolute() else (WORKSPACE_ROOT / p).resolve()
 
-
 def _run(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    """Run *cmd* capturing UTF‑8 output; raise on non‑zero exit."""
+    """Run *cmd* capturing UTF-8 output.
+
+    Accepts ripgrep’s exit-code 1 (== “no matches”) as non-fatal.
+    Raises RagToolError on any other non-zero exit status."""
     logger.debug("$ %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+    # 0 = ok, 1 = “no match” (per ripgrep), altrimenti errore
+    if result.returncode not in (0, 1):
         raise RagToolError(
-            f"Command failed (exit {result.returncode}): {' '.join(cmd)}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+            f"Command failed (exit {result.returncode}): {' '.join(cmd)}\n"
+            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         )
     return result
-
 
 # ---------------------------------------------------------------------------
 # Helper: persistent embedding cache
@@ -157,67 +160,69 @@ def codebase_search(
     explanation: str = "",
     target_directories: Optional[List[str]] = None,
     top_k: int = 5,
-    max_chunks: int = 100,       # nuovo parametro: numero massimo di chunk da embeddare
-    chunk_size: int = 40,        # dimensione finestra in righe
+    max_chunks: int = 100,
+    chunk_size: int = 40,
+    require_confirmation: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Semantic or regex fallback search for code snippets.
-
-    Args:
-        query: Free-form natural-language query.
-        explanation: Free-form justification (kept for spec parity).
-        target_directories: List of glob patterns or directories.
-        top_k: Number of results to return.
-        max_chunks: Max number of chunks to embed (to limit API calls).
-        chunk_size: Number of lines per chunk.
-
-    Returns:
-        List of dicts with file, start_line, end_line, snippet, score.
-    """
+    """Return the *top_k* code snippets semantically close to *query*."""
     if not query.strip():
         raise ValueError("Query must be non-empty.")
 
-    # --------------------------------------------- gather files (safe globbing)
     patterns = target_directories or DEFAULT_GLOB
     files: List[Path] = []
     for raw in patterns:
         pattern = str(raw).lstrip("/")
-        # Se è una directory
         abs_target = (WORKSPACE_ROOT / pattern).resolve()
-        if abs_target.is_dir():
-            files.extend(abs_target.rglob("*.py"))
-        else:
-            files.extend(WORKSPACE_ROOT.rglob(pattern))
+        files.extend(
+            abs_target.rglob("*.py") if abs_target.is_dir() else WORKSPACE_ROOT.rglob(pattern)
+        )
 
-    # Filtra file dentro EXCLUDE_DIRS
-    files = [
-        f for f in files
-        if f.is_file() and not any(part in EXCLUDE_DIRS for part in f.parts)
-    ]
-    if not files:
-        raise RuntimeError("No files matched search pattern(s).")
+    # filter & dedupe
+    unique_files = []
+    seen = set()
+    for f in files:
+        if (
+            f.is_file()
+            and not any(part in EXCLUDE_DIRS for part in f.parts)
+            and f not in seen
+        ):
+            unique_files.append(f)
+            seen.add(f)
 
-    # ------------------------------------------- semantic pathway (OpenAI)
+    if not unique_files:
+        raise RagToolError("No files matched search pattern(s).")
+
+    # confirmation gate
+    if require_confirmation:
+        print("\n[rag_tools] Candidate files for embedding (capped to 1000):")
+        for p in unique_files[:1000]:
+            print("  •", p.relative_to(WORKSPACE_ROOT))
+        ans = input("Proceed with semantic search and create embeddings? [y/N]: ").strip().lower()
+        if ans != "y":
+            print("[rag_tools] Aborted by user.")
+            sys.exit(0)
+
+    # semantic pathway -------------------------------------------------------
     if _OPENAI_AVAILABLE and os.getenv("OPENAI_API_KEY"):
         chunks: List[Tuple[Path, int, str]] = []
-        for file in files:
+        for file in unique_files:
             try:
                 lines = file.read_text(errors="ignore").splitlines()
             except Exception:
                 continue
             for i in range(0, len(lines), chunk_size):
-                snippet = "\n".join(lines[i : i + chunk_size])
-                chunks.append((file, i + 1, snippet))
+                chunks.append((file, i + 1, "\n".join(lines[i : i + chunk_size])))
                 if len(chunks) >= max_chunks:
                     break
             if len(chunks) >= max_chunks:
                 break
 
-        # Logging per capire quanti chunk
-        logging.info("Embedding %d chunks from %d files", len(chunks), len(files))
+        logger.info("Embedding %d chunks from %d files", len(chunks), len(unique_files))
 
         query_emb = _embed_text(query)
-        chunk_embs = [_embed_text(snippet) for _f, _l, snippet in chunks]
-        sims = cosine_similarity([query_emb], chunk_embs)[0]  # type: ignore
+        sims = cosine_similarity(  # type: ignore[arg-type]
+            [query_emb], [_embed_text(s) for _f, _l, s in chunks]
+        )[0]
         ranked = sorted(zip(chunks, sims), key=lambda t: t[1], reverse=True)[:top_k]
 
         return [
@@ -231,15 +236,13 @@ def codebase_search(
             for (file, start, snippet), score in ranked
         ]
 
-    # ------------------------------------------ regex fallback (ripgrep)
+    # ripgrep fallback -------------------------------------------------------
     if shutil.which("rg") is None:
-        raise RuntimeError("ripgrep unavailable and semantic search disabled.")
+        raise RagToolError("ripgrep unavailable and semantic search disabled.")
 
-    cmd = [*RG_DEFAULT_ARGS] + [
-        f"--glob={g.lstrip('/') or '*.py'}" for g in patterns
-    ]
+    cmd = [*RG_DEFAULT_ARGS] + [f"--glob={g.lstrip('/') or '*.py'}" for g in patterns]
     cmd.extend([query, str(WORKSPACE_ROOT)])
-    out = subprocess.run(cmd, capture_output=True, text=True).stdout.splitlines()[:top_k]
+    out = _run(cmd).stdout.splitlines()[:top_k]
 
     results: List[Dict[str, Any]] = []
     for line in out:
@@ -248,17 +251,10 @@ def codebase_search(
             ln = int(line_no)
         except ValueError:
             continue
-        results.append({
-            "file": file_part,
-            "start_line": ln,
-            "end_line": ln,
-            "snippet": snippet.strip(),
-            "score": 1.0,
-        })
+        results.append(
+            dict(file=file_part, start_line=ln, end_line=ln, snippet=snippet.strip(), score=1.0)
+        )
     return results
-
-
-
 
 # ---------------------------------------------------------------------------
 # 2. read_file
@@ -267,24 +263,37 @@ def codebase_search(
 def read_file(
     target_file: str | Path,
     start_line_one_indexed: int,
-    end_line_one_indexed_inclusive: int,
+    end_line_one_indexed_inclusive: int = None,
+    end_line_inclusive: int = None,
     *,
     explanation: str = "",
     should_read_entire_file: bool = False,
 ) -> Dict[str, str]:
-    """Return slice (≤250 lines) of *target_file* plus context summary."""
+    """Return slice (≤250 lines) of *target_file* plus context summary.
+
+    Args:
+        target_file: filepath to read
+        start_line_one_indexed: prima riga da includere (1-indexed)
+        end_line_one_indexed_inclusive: ultima riga da includere (1-indexed)
+        end_line_inclusive: alias deprecated per backwards compatibility
+    """
+    # gestiamo l’alias legacy
+    if end_line_one_indexed_inclusive is None and end_line_inclusive is not None:
+        end_line_one_indexed_inclusive = end_line_inclusive
+
     path = _resolve(target_file)
     if not path.exists():
         raise RagToolError(f"File not found: {path}")
 
     lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
     total = len(lines)
+
     if should_read_entire_file:
         selected = lines
     else:
         span = end_line_one_indexed_inclusive - start_line_one_indexed + 1
         if span > _READ_FILE_MAX_LINES:
-            raise RagToolError("read_file span exceeds 250‑line limit.")
+            raise RagToolError("read_file span exceeds 250-line limit.")
         selected = lines[start_line_one_indexed - 1 : end_line_one_indexed_inclusive]
 
     snippet = "\n".join(selected)
@@ -295,7 +304,6 @@ def read_file(
         summary_parts.append(f"… {total - end_line_one_indexed_inclusive} line(s) omitted after …")
 
     return {"snippet": snippet, "summary": " | ".join(summary_parts)}
-
 
 # ---------------------------------------------------------------------------
 # 3. run_terminal_cmd
@@ -374,16 +382,23 @@ def edit_file(
     instructions: str,
     code_edit: str,
 ) -> None:
-    """Apply *code_edit* mini‑diff to *target_file*.
+    """Apply *code_edit* mini-diff to *target_file*.
 
-    Uses difflib to generate a patch, ensuring minimal and safe modifications."""
+    Uses difflib to generate a patch, ensuring minimal and safe modifications.
+    Se manca il placeholder, emette solo un warning anziché sollevare errore."""
     path = _resolve(target_file)
     original_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
 
+    # Se manca il placeholder, non blocchiamo l’esecuzione ma avvisiamo
     if "// ... existing code ..." not in code_edit:
-        raise RagToolError("code_edit must include '// ... existing code ...' placeholder(s).")
+        logger.warning(
+            "edit_file: nessun placeholder “// ... existing code ...” trovato; "
+            "applico la patch comunque e sovrascrivo l’intero file."
+        )
 
+    # Rimuoviamo forzatamente i segnaposto per costruire la nuova versione
     patch_lines = [l.replace("// ... existing code ...", "") for l in code_edit.splitlines(keepends=True)]
+
     if unified_diff is None:
         raise RagToolError("difflib unavailable on this Python.")
 
@@ -401,7 +416,7 @@ def edit_file(
         raise RagToolError(f"Failed to write patched file: {exc}")
     else:
         backup.unlink(missing_ok=True)
-
+        logger.info("Patched %s successfully.", path)
 
 # ---------------------------------------------------------------------------
 # 7. file_search
