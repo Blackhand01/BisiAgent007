@@ -1,6 +1,6 @@
 # BisiAgent007
 
-**RAG-based AI coding assistant — your intelligent pair programming companion.**
+**RAG-based AI coding assistant - your intelligent pair programming companion.**
 
 ## Overview
 
